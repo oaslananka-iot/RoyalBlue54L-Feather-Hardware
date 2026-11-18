@@ -29,3 +29,6 @@ fp-info-cache
 # Exported BOM files
 *.xml
 *.csv
+
+# Generated BoardReadyOps manufacturing evidence (not reviewed source)
+build/boardreadyops-attested/
