@@ -158,11 +158,26 @@ jobs:
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
+      # Historical KiCad gitlinks are missing .gitmodules mappings. Even
+      # with submodules disabled, actions/checkout cleanup calls submodule
+      # foreach and fails. Fetch the immutable source commit directly.
       - name: Check out exact target commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ inputs.head_sha }}
-          persist-credentials: false
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full lowercase Git source SHA" >&2
+            exit 1
+          fi
+          # Keep pinned bootstrap tooling outside the reviewed source tree.
+          mv "$GITHUB_WORKSPACE/.boardreadyops-trusted-tooling" "$RUNNER_TEMP/boardreadyops-trusted-tooling"
+          git -C "$GITHUB_WORKSPACE" init --quiet
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c protocol.version=2 fetch --no-tags --no-recurse-submodules --depth=1 origin "$EXPECTED_SOURCE_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --detach --force FETCH_HEAD
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
 
       - name: Verify exact target commit
         env:
