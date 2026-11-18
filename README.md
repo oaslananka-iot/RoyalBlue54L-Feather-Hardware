@@ -1,5 +1,7 @@
 # RoyalBlue54L Feather
 
+[![GitGem](https://gitgem.org/api/badge/github/oaslananka-iot/RoyalBlue54L-Feather-Hardware.svg)](https://gitgem.org/github/oaslananka-iot/RoyalBlue54L-Feather-Hardware)
+
 An ARM + RISC-V Feather board with the new nRF54L15, built-in debugger, and smart PMIC
 
 <p align="center">
