@@ -126,6 +126,38 @@ jobs:
             done
           fi
 
+      # Install pinned trusted tooling from BoardReadyOps, not from the
+      # target repository's untrusted branch or default branch.
+      - name: Check out trusted runner tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: oaslananka/boardreadyops
+          ref: f942b9a4aa881ad0e8b868cb4922fc3e9f91652b
+          path: .boardreadyops-trusted-tooling
+          persist-credentials: false
+
+      - name: Install KiCad 10
+        id: kicad
+        env:
+          BRO_KICAD_VERSION: "10.0"
+          BRO_KICAD_PPA_SERIES: "10.0"
+          BRO_KICAD_INSTALL_MODE: oci
+        run: |
+          source .boardreadyops-trusted-tooling/scripts/install-kicad-ci.sh
+          version="$(kicad-cli version)"
+          case "$version" in
+            10.0.*) ;;
+            *)
+              echo "Expected KiCad 10.0.*, got $version" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#version}" -gt 64 ] || ! [[ "$version" =~ ^10\.0\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "KiCad version is not safely reportable" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
       - name: Check out exact target commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -142,26 +174,6 @@ jobs:
             exit 1
           fi
 
-      - name: Install KiCad 10
-        id: kicad
-        run: |
-          sudo add-apt-repository --yes ppa:kicad/kicad-10.0-releases
-          sudo apt-get update -qq
-          sudo apt-get install --yes kicad
-          version="$(kicad-cli version)"
-          case "$version" in
-            10.0.*) ;;
-            *)
-              echo "Expected KiCad 10.0.*, got $version" >&2
-              exit 1
-              ;;
-          esac
-          if [ "${#version}" -gt 64 ] || ! [[ "$version" =~ ^10\.0\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]]; then
-            echo "KiCad version is not safely reportable" >&2
-            exit 1
-          fi
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-
       - name: Run BoardReadyOps
         id: readiness
         continue-on-error: true
@@ -169,7 +181,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           BOARDREADYOPS_PR_HEAD_SHA: ${{ inputs.head_sha }}
           BOARDREADYOPS_CLOUD_RUN_ID: ${{ inputs.run_id }}
-        uses: oaslananka/boardreadyops@6d3b721c3f8307a517d360b28f4d50b824d81278 # v1.24.1
+        uses: oaslananka/boardreadyops@a4f917f8fc46cb433868d5fc05daee2a7ac4aa61 # reviewed main, release pending
         with:
           project: ${{ vars.BOARDREADYOPS_PROJECT || '' }}
           config: ${{ vars.BOARDREADYOPS_CONFIG || 'boardreadyops.yml' }}
@@ -184,11 +196,34 @@ jobs:
           upload-artifacts: "true"
           comment-pr: "false"
 
+      # The readiness Action writes JSON/SARIF/Markdown into GITHUB_WORKSPACE.
+      # Its completed artifact upload already retains the reports for users.
+      # Move only these known untracked reports out before the manufacturing
+      # exporter independently checks the entire reviewed source checkout.
+      - name: Stage readiness reports outside reviewed source
+        id: stage-readiness-reports
+        if: always() && steps.validate.outcome == 'success' && steps.readiness.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in boardreadyops.findings.json boardreadyops.sarif.json boardreadyops.report.md; do
+            if [[ -e "$name" || -L "$name" ]]; then
+              if [[ ! -f "$name" || -L "$name" ]] || git ls-files --error-unmatch -- "$name" > /dev/null 2>&1; then
+                echo "::error::Readiness report must be an untracked regular file: $name"
+                exit 1
+              fi
+              if [[ -e "$RUNNER_TEMP/$name" || -L "$RUNNER_TEMP/$name" ]]; then
+                echo "::error::Readiness report destination already exists: $name"
+                exit 1
+              fi
+              mv -- "$name" "$RUNNER_TEMP/$name"
+            fi
+          done
       # Optional source-bound manufacturing evidence. The readiness run remains
       # usable without this project setting; no delivery or share is authorized here.
       - name: Export manufacturing artifacts from the exact reviewed source
         id: manufacturing-export
-        if: always() && steps.validate.outcome == 'success' && steps.kicad.outcome == 'success' && vars.BOARDREADYOPS_PROJECT != ''
+        if: always() && steps.validate.outcome == 'success' && steps.kicad.outcome == 'success' && steps.stage-readiness-reports.outcome == 'success' && vars.BOARDREADYOPS_PROJECT != ''
         continue-on-error: true
         uses: oaslananka/boardreadyops/.github/actions/manufacturing-attested-export@bbdfd58631d5c8daca1179a10f74b45533903b58
         with:
@@ -265,9 +300,46 @@ jobs:
           tar -rf "$RUNNER_TEMP/boardreadyops-manufacturing-export.tar" -C "$RUNNER_TEMP" bundle.sigstore.json
           gzip -f "$RUNNER_TEMP/boardreadyops-manufacturing-export.tar"
 
-      - name: Import verified manufacturing evidence into this run
-        id: manufacturing-export-import
-        if: steps.manufacturing-attestation.outcome == 'success'
+      # The Actions upload cannot exceed the same 128 MiB archive import limit.
+      - name: Check temporary signed archive size
+        id: manufacturing-temporary-budget
+        if: steps.manufacturing-attestation.outcome == 'success' && vars.BOARDREADYOPS_MANUFACTURING_TEMP_ARTIFACTS == 'true' && vars.BOARDREADYOPS_MANUFACTURING_OBJECT_STORAGE != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/boardreadyops-manufacturing-export.tar.gz"
+          test -f "$archive" && test ! -L "$archive" && test -s "$archive"
+          bytes="$(stat -c '%s' "$archive")"
+          if (( bytes > 134217728 )); then
+            echo "::error::Signed manufacturing archive exceeds 128 MiB import limit"
+            exit 1
+          fi
+
+      # Opt-in only. This temporary download is not manufacturing approval.
+      - name: Keep signed manufacturing archive temporarily in GitHub Actions
+        id: manufacturing-temporary-artifact
+        if: steps.manufacturing-temporary-budget.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: boardreadyops-manufacturing-${{ inputs.run_id }}-${{ inputs.execution_attempt_id }}
+          path: ${{ runner.temp }}/boardreadyops-manufacturing-export.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Reject conflicting manufacturing archive storage modes
+        if: vars.BOARDREADYOPS_MANUFACTURING_OBJECT_STORAGE == 'true' && vars.BOARDREADYOPS_MANUFACTURING_TEMP_ARTIFACTS == 'true'
+        shell: bash
+        run: |
+          echo "::error::Select exactly one manufacturing archive storage mode"
+          exit 1
+
+      # The GitHub runner receives only a short-lived signed PUT for pending/.
+      - name: Import signed manufacturing archive via private object storage
+        id: manufacturing-object-import
+        if: steps.manufacturing-attestation.outcome == 'success' && vars.BOARDREADYOPS_MANUFACTURING_OBJECT_STORAGE == 'true' && vars.BOARDREADYOPS_MANUFACTURING_TEMP_ARTIFACTS != 'true'
         continue-on-error: true
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
@@ -275,6 +347,70 @@ jobs:
           EXECUTION_ATTEMPT_ID: ${{ inputs.execution_attempt_id }}
           HEAD_SHA: ${{ inputs.head_sha }}
           CLOUD_ORIGIN: https://boardreadyops.com
+        with:
+          script: |
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const archive = fs.readFileSync(process.env.RUNNER_TEMP + "/boardreadyops-manufacturing-export.tar.gz");
+            if (!archive.length || archive.length > 134217728) {
+              throw new Error("Manufacturing archive exceeds 128 MiB");
+            }
+            const sha256 = crypto.createHash("sha256").update(archive).digest("hex");
+            const origin = process.env.CLOUD_ORIGIN;
+            if (!origin || new URL(origin).protocol !== "https:") {
+              throw new Error("BoardReadyOps HTTPS cloud origin is not configured");
+            }
+            const endpoint = new URL(
+              "/api/v1/runs/" + encodeURIComponent(process.env.RUN_ID) +
+                "/attempts/" + encodeURIComponent(process.env.EXECUTION_ATTEMPT_ID) +
+                "/manufacturing-export/object", origin,
+            );
+            const audience = "boardreadyops-manufacturing-export:" + process.env.RUN_ID + ":" +
+              process.env.EXECUTION_ATTEMPT_ID + ":" + process.env.HEAD_SHA;
+            const token = await core.getIDToken(audience);
+            const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
+            const prepared = await fetch(endpoint, {
+              method: "POST", headers,
+              body: JSON.stringify({ operation: "prepare", sha256, bytes: archive.length }),
+            });
+            if (!prepared.ok) throw new Error("Object upload preparation HTTP " + prepared.status);
+            const ticket = await prepared.json();
+            if (
+              !ticket.ok || ticket.sha256 !== sha256 || ticket.bytes !== archive.length ||
+              typeof ticket.uploadId !== "string" || typeof ticket.ticket !== "string" ||
+              !ticket.headers || ticket.headers["x-amz-checksum-sha256"] !== Buffer.from(sha256, "hex").toString("base64")
+            ) throw new Error("Invalid source-bound object upload ticket");
+            const uploadUrl = new URL(ticket.uploadUrl);
+            if (uploadUrl.protocol !== "https:" || !uploadUrl.hostname.endsWith(".aws.neon.tech")) {
+              throw new Error("Untrusted private manufacturing upload destination");
+            }
+            const uploaded = await fetch(uploadUrl, { method: "PUT", headers: ticket.headers, body: archive });
+            if (!uploaded.ok) throw new Error("Private object upload HTTP " + uploaded.status);
+            const committed = await fetch(endpoint, {
+              method: "POST", headers,
+              body: JSON.stringify({
+                operation: "commit", uploadId: ticket.uploadId, sha256, bytes: archive.length,
+                expiresAt: ticket.expiresAt, ticket: ticket.ticket,
+              }),
+            });
+            if (!committed.ok) throw new Error("Private object verification HTTP " + committed.status);
+            const result = await committed.json();
+            if (!result.ok || result.sha256 !== sha256 || result.bytes !== archive.length) {
+              throw new Error("Verified manufacturing archive integrity did not match");
+            }
+            core.info("Private, source-verified manufacturing archive recorded.");
+
+      - name: Import verified manufacturing evidence into this run
+        id: manufacturing-export-import
+        if: steps.manufacturing-attestation.outcome == 'success' && (vars.BOARDREADYOPS_MANUFACTURING_TEMP_ARTIFACTS != 'true' || steps.manufacturing-temporary-artifact.outcome == 'success') && vars.BOARDREADYOPS_MANUFACTURING_OBJECT_STORAGE != 'true'
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          EXECUTION_ATTEMPT_ID: ${{ inputs.execution_attempt_id }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          CLOUD_ORIGIN: https://boardreadyops.com
+          GH_ARTIFACT_ID: ${{ steps.manufacturing-temporary-artifact.outputs.artifact-id }}
           TRUST_MODE: ${{ inputs.safe_mode == 'true' && 'safe' || 'standard' }}
           SAFE_MODE_REASONS: ${{ inputs.safe_mode_reasons }}
         with:
@@ -291,7 +427,7 @@ jobs:
             const archive = fs.readFileSync(process.env.RUNNER_TEMP + "/boardreadyops-manufacturing-export.tar.gz");
             const response = await fetch(url, {
               method: "POST",
-              headers: { authorization: `Bearer ${token}`, "content-type": "application/gzip" },
+              headers: { authorization: `Bearer ${token}`, "content-type": "application/gzip", "x-boardreadyops-github-artifact-id": process.env.GH_ARTIFACT_ID || "" },
               body: archive,
             });
             if (!response.ok) throw new Error("Signed manufacturing evidence import returned HTTP " + response.status);
@@ -321,7 +457,7 @@ jobs:
             const readinessOutcome = process.env.READINESS_OUTCOME;
             const trustMode = process.env.SAFE_MODE === "true" ? "safe" : "standard";
             const safeModeReasons = process.env.SAFE_MODE_REASONS ?? "";
-            const reportPath = "boardreadyops.findings.json";
+            const reportPath = `${process.env.RUNNER_TEMP}/boardreadyops.findings.json`;
 
             let report;
             try {
@@ -372,6 +508,39 @@ jobs:
                 ? { path: boundedText(finding.resource.path, "unknown", 1024) }
                 : {}),
             }));
+            // Forward only the already-computed, source-bound readiness verdict.
+            // An untrusted or older report without a valid assessment stays unverified:
+            // never synthesize 100/100, drop warnings, or forward profile/evidence metadata.
+            const observedReadiness = reportAvailable ? report.readiness : undefined;
+            const boundedCount = (value, maximum) =>
+              Number.isInteger(value) && value >= 0 && value <= maximum;
+            const boundedStrings = (values, maximumLength) =>
+              Array.isArray(values) &&
+              values.length <= 100 &&
+              values.every((value) =>
+                typeof value === "string" &&
+                value.trim().length > 0 &&
+                value.trim().length <= maximumLength);
+            const readiness =
+              observedReadiness &&
+              typeof observedReadiness === "object" &&
+              boundedCount(observedReadiness.score, 100) &&
+              ["ready", "at-risk", "blocked"].includes(observedReadiness.status) &&
+              boundedCount(observedReadiness.blocking, 10000) &&
+              boundedCount(observedReadiness.nonBlocking, 10000) &&
+              boundedStrings(observedReadiness.missingRequired, 256) &&
+              boundedStrings(observedReadiness.missingRecommended, 256) &&
+              boundedStrings(observedReadiness.warnings, 1000)
+                ? {
+                    score: observedReadiness.score,
+                    status: observedReadiness.status,
+                    blocking: observedReadiness.blocking,
+                    nonBlocking: observedReadiness.nonBlocking,
+                    missingRequired: observedReadiness.missingRequired.map((value) => value.trim()),
+                    missingRecommended: observedReadiness.missingRecommended.map((value) => value.trim()),
+                    warnings: observedReadiness.warnings.map((value) => value.trim()),
+                  }
+                : undefined;
             const rawBoms = reportAvailable && Array.isArray(report.boms) ? report.boms : [];
             const componentText = (value, maximum) => {
               const normalized = String(value ?? "").trim();
@@ -440,6 +609,7 @@ jobs:
               reportLinks,
               ...(Object.keys(toolVersions).length > 0 ? { toolVersions } : {}),
               ...(hardwareImpact ? { hardwareImpact } : {}),
+              ...(readiness ? { readiness } : {}),
               ...(boms.length > 0 ? { boms } : {}),
             };
             const payloadTooLarge = () => Buffer.byteLength(JSON.stringify(payload), "utf8") > 900 * 1024;
@@ -575,10 +745,79 @@ jobs:
             exit 1
           fi
 
-      - name: Check out default branch
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # The setup probe validates one tracked config file, not the PCB source tree.
+      # A malformed, unrelated gitlink must not prevent that configuration check.
+      - name: Read configuration from authenticated GitHub commit
+        id: source
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CONFIG_PATH: ${{ vars.BOARDREADYOPS_CONFIG || 'boardreadyops.yml' }}
         with:
-          persist-credentials: false
+          script: |
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const configPath = String(process.env.CONFIG_PATH ?? "").trim();
+            const segments = configPath.split("/");
+            if (
+              !configPath ||
+              configPath.length > 256 ||
+              configPath.startsWith("/") ||
+              configPath.includes("\\") ||
+              /[\x00-\x1f\x7f]/u.test(configPath) ||
+              segments.length > 16 ||
+              segments.some((segment) => !segment || segment === "." || segment === "..")
+            ) {
+              throw new Error("CONFIG_PATH must be a normalized repository-relative file path");
+            }
+            const { owner, repo } = context.repo;
+            const observedSha = context.sha;
+            if (!/^[a-f0-9]{40}$/u.test(observedSha) || !/^refs\/heads\//u.test(context.ref)) {
+              throw new Error("Setup probe requires a verified branch commit");
+            }
+            const commit = await github.rest.git.getCommit({ owner, repo, commit_sha: observedSha });
+            let treeSha = commit.data.tree.sha;
+            let file;
+            for (const [index, segment] of segments.entries()) {
+              const response = await github.rest.git.getTree({ owner, repo, tree_sha: treeSha });
+              const entry = response.data.tree.find((item) => item.path === segment);
+              if (!entry) break;
+              if (index === segments.length - 1) {
+                if (entry.type !== "blob" || !["100644", "100755"].includes(entry.mode)) {
+                  throw new Error("CONFIG_PATH must be a tracked regular file, not a symlink or gitlink");
+                }
+                if (!Number.isSafeInteger(entry.size) || entry.size > 65536) {
+                  throw new Error("Repository configuration exceeds the 64 KiB setup probe limit");
+                }
+                file = entry;
+              } else {
+                if (entry.type !== "tree" || entry.mode !== "040000") {
+                  throw new Error("CONFIG_PATH parent must be a tracked directory");
+                }
+                treeSha = entry.sha;
+              }
+            }
+            if (file) {
+              const response = await github.rest.git.getBlob({ owner, repo, file_sha: file.sha });
+              const blob = response.data;
+              const base64 = String(blob.content ?? "").replace(/\s/gu, "");
+              if (
+                blob.encoding !== "base64" ||
+                !Number.isSafeInteger(blob.size) ||
+                blob.size > 65536 ||
+                !/^[A-Za-z0-9+/]*={0,2}$/u.test(base64)
+              ) {
+                throw new Error("Invalid GitHub configuration blob");
+              }
+              const bytes = Buffer.from(base64, "base64");
+              if (bytes.length !== blob.size || bytes.length !== file.size || bytes.toString("base64") !== base64) {
+                throw new Error("GitHub configuration blob size or encoding does not match the commit tree");
+              }
+              const destination = path.join(process.env.RUNNER_TEMP, "boardreadyops-setup-probe");
+              fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
+              fs.writeFileSync(path.join(destination, "boardreadyops.yml"), bytes, { flag: "wx", mode: 0o600 });
+            }
+            core.setOutput("observed_sha", observedSha);
+            core.setOutput("config_status", file ? "found" : "missing");
 
       - name: Check out verified BoardReadyOps release
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -596,11 +835,12 @@ jobs:
         id: inspect
         env:
           BOARDREADYOPS_LOCALE: en
-          CONFIG_PATH: ${{ vars.BOARDREADYOPS_CONFIG || 'boardreadyops.yml' }}
+          OBSERVED_SHA: ${{ steps.source.outputs.observed_sha }}
+          SOURCE_STATUS: ${{ steps.source.outputs.config_status }}
         run: |
-          observed_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          observed_sha="$OBSERVED_SHA"
           if ! [[ "$observed_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "default-branch checkout did not resolve to a full commit SHA" >&2
+            echo "GitHub source inspection did not resolve a full commit SHA" >&2
             exit 1
           fi
 
@@ -613,58 +853,27 @@ jobs:
           OBSERVED_SHA="$observed_sha" TOOL_VERSION="$tool_version" node <<'NODE'
           const fs = require("node:fs");
           const path = require("node:path");
-          const { execFileSync } = require("node:child_process");
-
-          const workspace = fs.realpathSync(process.env.GITHUB_WORKSPACE);
-          const configured = String(process.env.CONFIG_PATH ?? "").trim();
           const observedSha = process.env.OBSERVED_SHA;
           const toolVersion = process.env.TOOL_VERSION;
-          if (!configured || path.isAbsolute(configured)) {
-            throw new Error("CONFIG_PATH must stay within the checked-out repository");
-          }
-
-          const candidate = path.resolve(workspace, configured);
-          const relative = path.relative(workspace, candidate);
-          if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-            throw new Error("CONFIG_PATH must stay within the checked-out repository");
-          }
-
-          let tracked = true;
-          try {
-            execFileSync("git", ["-C", workspace, "ls-files", "--error-unmatch", "--", configured], {
-              stdio: "ignore",
-            });
-          } catch {
-            tracked = false;
-          }
-          if (!tracked || !fs.existsSync(candidate)) {
+          const status = process.env.SOURCE_STATUS;
+          if (status === "missing") {
             fs.writeFileSync("setup-result.json", JSON.stringify({
               contractVersion: 1,
               configStatus: "missing",
               observedSha,
               toolVersion,
-              diagnostics: ["The configured BoardReadyOps path is missing on the default branch."],
+              diagnostics: ["The configured BoardReadyOps path is missing at the verified branch commit."],
             }));
             process.exit(0);
           }
-
-          const metadata = fs.lstatSync(candidate);
-          const realCandidate = fs.realpathSync(candidate);
-          const realRelative = path.relative(workspace, realCandidate);
-          if (
-            metadata.isSymbolicLink() ||
-            !metadata.isFile() ||
-            realRelative === ".." ||
-            realRelative.startsWith(`..${path.sep}`) ||
-            path.isAbsolute(realRelative)
-          ) {
-            throw new Error("CONFIG_PATH must resolve to a tracked regular file inside the checked-out repository");
+          if (status !== "found") {
+            throw new Error("GitHub source inspection did not confirm a configuration file");
           }
-
-          const probeRoot = path.join(process.env.RUNNER_TEMP, "boardreadyops-setup-probe");
-          fs.rmSync(probeRoot, { recursive: true, force: true });
-          fs.mkdirSync(probeRoot, { recursive: true });
-          fs.copyFileSync(realCandidate, path.join(probeRoot, "boardreadyops.yml"));
+          const candidate = path.join(process.env.RUNNER_TEMP, "boardreadyops-setup-probe", "boardreadyops.yml");
+          const metadata = fs.lstatSync(candidate);
+          if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size > 65536) {
+            throw new Error("Verified repository configuration was not staged as a regular bounded file");
+          }
           NODE
 
           if [ -f setup-result.json ]; then
